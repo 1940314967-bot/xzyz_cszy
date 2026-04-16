@@ -229,12 +229,15 @@ contract CCU is ERC20, EIP712, Ownable, Pausable {
     address public oracleSigner;     
     // Anti-replay ledger: Record used nonces
     mapping(uint256 => bool) public usedNonces; 
+    // Strong replay ledger: each signed claim payload can only be consumed once.
+    mapping(bytes32 => bool) public usedClaimHashes;
 
     // Bonding curve events: Mint and burn
     event Minted(address indexed buyer, uint256 amount, uint256 cost);
     event Burned(address indexed seller, uint256 amount, uint256 refund);
     // Exclusive event for claiming tokens via oracle signature
-    event CCUClaimed(address indexed user, uint256 amount, uint256 nonce);
+    event CCUClaimed(address indexed user, uint256 amount, uint256 nonce, uint256 deadline);
+    event OracleSignerUpdated(address indexed previousSigner, address indexed newSigner);
 
     // Init token info, EIP-712 domain separator, and grant deployer admin rights
     constructor() 
@@ -256,7 +259,9 @@ contract CCU is ERC20, EIP712, Ownable, Pausable {
     // Set trusted oracle address (Admin only)
     function setOracleSigner(address _signer) external onlyOwner {
         require(_signer != address(0), "Invalid signer");
+        address previous = oracleSigner;
         oracleSigner = _signer;
+        emit OracleSignerUpdated(previous, _signer);
     }
 
     // Trigger emergency pause to freeze core transactions (Admin only)
@@ -270,16 +275,21 @@ contract CCU is ERC20, EIP712, Ownable, Pausable {
     }
 
     // Core claim logic: Verify oracle signature and mint tokens securely (Protected by pause)
-    function claimCCU(uint256 amount, uint256 nonce, bytes calldata signature) external whenNotPaused {
+    function claimCCU(uint256 amount, uint256 nonce, uint256 deadline, bytes calldata signature) external whenNotPaused {
         // Security layer 1: Block reused nonces to prevent replay attacks
         require(!usedNonces[nonce], "Nonce already used");
+        require(block.timestamp <= deadline, "Signature expired");
+
+        bytes32 claimHash = keccak256(abi.encode(msg.sender, amount, nonce, deadline));
+        require(!usedClaimHashes[claimHash], "Claim hash already used");
 
         // Crypto step 1: Pack and hash business data strictly following EIP-712
         bytes32 structHash = keccak256(abi.encode(
-            keccak256("ClaimData(address user,uint256 amount,uint256 nonce)"),
+            keccak256("ClaimData(address user,uint256 amount,uint256 nonce,uint256 deadline)"),
             msg.sender,
             amount,
-            nonce
+            nonce,
+            deadline
         ));
         // Crypto step 2: Generate the final structured digest verification hash
         bytes32 hash = _hashTypedDataV4(structHash);
@@ -292,11 +302,12 @@ contract CCU is ERC20, EIP712, Ownable, Pausable {
 
         // State update: Invalidate current nonce
         usedNonces[nonce] = true;
+        usedClaimHashes[claimHash] = true;
         // Asset settlement: Mint tokens using standard 18-decimal precision
         _mint(msg.sender, amount * (10 ** decimals()));
         
         // Broadcast successful claim event
-        emit CCUClaimed(msg.sender, amount, nonce);
+        emit CCUClaimed(msg.sender, amount, nonce, deadline);
     }
     // current supply
     function currentSupply() public view returns (uint256) {
